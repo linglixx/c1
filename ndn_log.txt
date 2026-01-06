@@ -1,0 +1,4 @@
+Waf: Entering directory `/home/xin/ndnSIM/ns-3/build'
+Waf: Leaving directory `/home/xin/ndnSIM/ns-3/build'
+Build commands will be stored in build/compile_commands.json
+'build' finished successfully (1.989s)
