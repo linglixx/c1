@@ -1,94 +1,131 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-#ifndef NFD_FW_Q_LEARNING_STRATEGY_HPP
-#define NFD_FW_Q_LEARNING_STRATEGY_HPP
+/*
+ * Copyright (c) 2024 Your Name/Organization
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
-#include "fw/strategy.hpp"
-#include "fw/algorithm.hpp"
+#ifndef NFD_DAEMON_FW_Q_LEARNING_STRATEGY_HPP
+#define NFD_DAEMON_FW_Q_LEARNING_STRATEGY_HPP
+
+#include "strategy.hpp"
+#include "fw/retx-suppression-exponential.hpp"
 #include <unordered_map>
+#include <vector>
 #include <random>
-#include <ns3/ndnSIM/model/ndn-net-device-transport.hpp>
-#include <ns3/point-to-point-channel.h>
 
 namespace nfd {
 namespace fw {
 
-// 定义状态类型：简化为「当前节点ID + Interest前缀 + 下一跳链路状态摘要」
-struct QState {
-  uint32_t nodeId;          // 当前节点ID
-  std::string prefix;       // Interest前缀
-  std::vector<double> linkStats; // 下一跳链路的延迟（简化为均值）
-
-  // 重载哈希函数，用于Q表的key
-  bool operator==(const QState& other) const {
-    return nodeId == other.nodeId && prefix == other.prefix && linkStats == other.linkStats;
-  }
-};
-
-// 自定义QState的哈希函数
-struct QStateHash {
-  size_t operator()(const QState& s) const {
-    size_t h = std::hash<uint32_t>()(s.nodeId);
-    h ^= std::hash<std::string>()(s.prefix) << 1;
-    for (auto val : s.linkStats) {
-      h ^= std::hash<double>()(val) << 1;
-    }
-    return h;
-  }
-};
-
-// Q表类型：QState -> (动作(下一跳FaceID) -> Q值)
-using QTable = std::unordered_map<QState, std::unordered_map<uint64_t, double>, QStateHash>;
-
-class QLearningStrategy : public Strategy {
+class QLearningStrategy : public Strategy
+{
 public:
+  explicit
+  QLearningStrategy(Forwarder& forwarder, const Name& name = getStrategyName());
+
   static const Name&
   getStrategyName();
 
-  QLearningStrategy(Forwarder& forwarder, const Name& name);
-
-  // 重写Interest接收后的处理函数（核心决策逻辑）
+public: // triggers
   void
   afterReceiveInterest(const Interest& interest, const FaceEndpoint& ingress,
                        const shared_ptr<pit::Entry>& pitEntry) override;
 
-  // 重写Data满足Interest时的回调（计算奖励、更新Q表）
   void
-  beforeSatisfyInterest(const shared_ptr<pit::Entry>& pitEntry,
-                        const FaceEndpoint& ingress, const Data& data) override;
+  afterReceiveData(const Data& data, const FaceEndpoint& ingress,
+                   const shared_ptr<pit::Entry>& pitEntry) override;
 
-  // 重写Interest超时时的回调（负奖励、更新Q表）
   void
-  beforeExpirePendingInterest(const shared_ptr<pit::Entry>& pitEntry) override;
+  afterReceiveNack(const lp::Nack& nack, const FaceEndpoint& ingress,
+                   const shared_ptr<pit::Entry>& pitEntry) override;
 
-private:
-  // 获取当前状态
-  QState
-  getCurrentState(const FaceEndpoint& ingress, const Interest& interest);
-
-  // ε-greedy选择动作（下一跳FaceID）
-  uint64_t
-  chooseAction(const QState& state, const fib::NextHopList& nexthops);
-
-  // 更新Q表
   void
-  updateQTable(const QState& state, uint64_t action, double reward, const QState& nextState);
+  onDroppedInterest(const Interest& interest, Face& egress) override;
 
-  // 获取链路状态（如延迟）
+public: // 改为public，解决访问权限问题
+  struct State
+  {
+    Name prefix;
+    FaceId ingressFace;
+    std::vector<FaceId> availableNextHops;
+
+    // 用于哈希的辅助函数
+    bool operator==(const State& other) const
+    {
+      return prefix == other.prefix && ingressFace == other.ingressFace &&
+             availableNextHops == other.availableNextHops;
+    }
+  };
+
+  using Action = FaceId; // 动作：选择下一跳FaceId
+  using QTable = std::unordered_map<State, std::unordered_map<Action, double>>;
+
+protected:
+  // 重载extractState：支持Interest和Name两种参数
+  State
+  extractState(const Interest& interest, const FaceEndpoint& ingress,
+               const shared_ptr<pit::Entry>& pitEntry) const;
+
+  State
+  extractState(const Name& prefix, const FaceEndpoint& ingress,
+               const shared_ptr<pit::Entry>& pitEntry) const;
+
+  Action
+  selectAction(const State& state);
+
+  void
+  updateQValue(const State& currentState, Action action, double reward, const State& nextState);
+
   double
-  getLinkDelay(const Face& face);
+  calculateReward(bool isSuccess, FaceId faceId) const;
+
+  std::vector<FaceId>
+  getAvailableNextHops(const pit::Entry& pitEntry) const;
 
 private:
-  QTable m_qTable;          // Q表
-  double m_alpha = 0.1;     // 学习率
-  double m_gamma = 0.9;     // 折扣因子
-  double m_epsilon = 0.2;   // 探索率（20%概率随机选择动作）
-  std::mt19937 m_rng;       // 随机数生成器
+  QTable m_qTable;
+  RetxSuppressionExponential m_retxSuppression;
+  std::mt19937 m_randomEngine;
+  double m_learningRate = 0.1;    // 学习率α
+  double m_discountFactor = 0.9;  // 折扣因子γ
+  double m_epsilon = 0.1;         // ε-贪心策略的探索概率
 
-  // 记录「PIT条目 -> 所选动作+状态」，用于后续奖励计算
-  std::unordered_map<shared_ptr<pit::Entry>, std::pair<QState, uint64_t>> m_pitActionMap;
+  // 奖励值定义
+  static constexpr double REWARD_SUCCESS = 10.0;
+  static constexpr double REWARD_FAILURE = -5.0;
+  static constexpr double REWARD_DROP = -10.0;
 };
 
 } // namespace fw
 } // namespace nfd
 
-#endif // NFD_FW_Q_LEARNING_STRATEGY_HPP
+// 自定义哈希函数，用于State的unordered_map
+namespace std {
+template<>
+struct hash<nfd::fw::QLearningStrategy::State>
+{
+  size_t
+  operator()(const nfd::fw::QLearningStrategy::State& state) const
+  {
+    size_t h = hash<ndn::Name>()(state.prefix);
+    h ^= hash<nfd::FaceId>()(state.ingressFace) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    for (auto faceId : state.availableNextHops) {
+      h ^= hash<nfd::FaceId>()(faceId) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    }
+    return h;
+  }
+};
+} // namespace std
+
+#endif // NFD_DAEMON_FW_Q_LEARNING_STRATEGY_HPP

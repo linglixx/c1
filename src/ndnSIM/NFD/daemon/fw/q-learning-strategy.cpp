@@ -1,9 +1,30 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-#include "q-learning-strategy.hpp"
-#include "core/logger.hpp"
-#include <boost/random/uniform_real_distribution.hpp>
+/*
+ * Copyright (c) 2024 Your Name/Organization
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
-NFD_LOG_INIT("QLearningStrategy");
+#include "q-learning-strategy.hpp"
+#include "algorithm.hpp"
+#include "common/global.hpp"
+#include "ndn-cxx/util/logger.hpp"
+#include "table/pit.hpp"
+
+NFD_LOG_INIT(QLearningStrategy);
+NDN_LOG_DEBUG("Forward Interest: " << interest.getName());
+NFD_REGISTER_STRATEGY(QLearningStrategy);
 
 namespace nfd {
 namespace fw {
@@ -11,193 +32,239 @@ namespace fw {
 const Name&
 QLearningStrategy::getStrategyName()
 {
-  static Name strategyName("ndn:/localhost/nfd/strategy/q-learning/%FD%01");
+  static const Name strategyName("/localhost/nfd/strategy/q-learning/%FD%01");
   return strategyName;
 }
 
 QLearningStrategy::QLearningStrategy(Forwarder& forwarder, const Name& name)
   : Strategy(forwarder)
-  , m_rng(std::random_device{}())
+  , m_retxSuppression(RetxSuppressionExponential::DEFAULT_INITIAL_INTERVAL,
+                      RetxSuppressionExponential::DEFAULT_MULTIPLIER,
+                      RetxSuppressionExponential::DEFAULT_MAX_INTERVAL)
+  , m_randomEngine(random::generateSeed())
 {
+  ParsedInstanceName parsed = parseInstanceName(name);
+  if (!parsed.parameters.empty()) {
+    NDN_THROW(std::invalid_argument("QLearningStrategy does not accept parameters"));
+  }
+  if (parsed.version && *parsed.version != getStrategyName()[-1].toVersion()) {
+    NDN_THROW(std::invalid_argument(
+      "QLearningStrategy does not support version " + to_string(*parsed.version)));
+  }
   this->setInstanceName(makeInstanceName(name, getStrategyName()));
 }
 
-// 获取当前网络状态（简化版：节点ID + 前缀 + 下一跳链路延迟）
-QLearningStrategy::QState
-QLearningStrategy::getCurrentState(const FaceEndpoint& ingress, const Interest& interest)
-{
-  QState state;
-  // 获取当前节点ID（从ns3的Node中提取，需结合ndnSIM的NetDeviceTransport）
-  auto transport = dynamic_cast<ns3::ndn::NetDeviceTransport*>(ingress.face.getTransport());
-  if (transport != nullptr) {
-    state.nodeId = transport->GetNetDevice()->GetNode()->GetId();
-  } else {
-    state.nodeId = 0; // 默认值
-  }
-  state.prefix = interest.getName().getPrefix(2).toUri(); // 取前缀前2级，简化状态
-
-  // 获取所有下一跳的链路延迟（简化为均值）
-  auto pitEntry = this->getForwarder().getPit().find(interest);
-  if (pitEntry != nullptr) {
-    const fib::Entry& fibEntry = this->lookupFib(*pitEntry);
-    for (const auto& nexthop : fibEntry.getNextHops()) {
-      state.linkStats.push_back(getLinkDelay(nexthop.getFace()));
-    }
-  }
-  return state;
-}
-
-// 获取链路延迟（从ns3的PointToPointChannel中提取）
-double
-QLearningStrategy::getLinkDelay(const Face& face)
-{
-  auto transport = dynamic_cast<ns3::ndn::NetDeviceTransport*>(face.getTransport());
-  if (transport == nullptr) return 10.0; // 默认延迟10ms
-
-  auto nd = transport->GetNetDevice()->GetObject<ns3::PointToPointNetDevice>();
-  if (nd == nullptr) return 10.0;
-
-  auto channel = ns3::DynamicCast<ns3::PointToPointChannel>(nd->GetChannel());
-  if (channel == nullptr) return 10.0;
-
-  // 返回链路延迟（单位：ms）
-  return channel->GetDelay().GetMilliSeconds();
-}
-
-// ε-greedy选择动作（下一跳FaceID）
-uint64_t
-QLearningStrategy::chooseAction(const QState& state, const fib::NextHopList& nexthops)
-{
-  boost::random::uniform_real_distribution<> dist(0, 1);
-  if (dist(m_rng) < m_epsilon) {
-    // 探索：随机选择有效下一跳
-    std::vector<uint64_t> validFaces;
-    for (const auto& nh : nexthops) {
-      if (wouldViolateScope(ingress.face, interest, nh.getFace())) continue;
-      validFaces.push_back(nh.getFace().getId());
-    }
-    if (validFaces.empty()) return 0;
-    boost::random::uniform_int_distribution<> faceDist(0, validFaces.size()-1);
-    return validFaces[faceDist(m_rng)];
-  } else {
-    // 利用：选择Q值最大的动作
-    double maxQ = -1e9;
-    uint64_t bestFaceId = 0;
-    auto it = m_qTable.find(state);
-    if (it != m_qTable.end()) {
-      for (const auto& nh : nexthops) {
-        uint64_t faceId = nh.getFace().getId();
-        if (wouldViolateScope(ingress.face, interest, nh.getFace())) continue;
-        double qVal = it->second.count(faceId) ? it->second.at(faceId) : 0.0;
-        if (qVal > maxQ) {
-          maxQ = qVal;
-          bestFaceId = faceId;
-        }
-      }
-    }
-    return bestFaceId == 0 ? nexthops.begin()->getFace().getId() : bestFaceId;
-  }
-}
-
-// 更新Q表（Q-learning核心公式）
-void
-QLearningStrategy::updateQTable(const QState& state, uint64_t action, double reward, const QState& nextState)
-{
-  double oldQ = m_qTable[state][action]; // 若不存在则默认0
-  // 计算nextState的最大Q值
-  double maxNextQ = 0.0;
-  auto it = m_qTable.find(nextState);
-  if (it != m_qTable.end()) {
-    for (const auto& pair : it->second) {
-      if (pair.second > maxNextQ) maxNextQ = pair.second;
-    }
-  }
-  // Q(s,a) = Q(s,a) + α*(R + γ*maxQ(s',a') - Q(s,a))
-  double newQ = oldQ + m_alpha * (reward + m_gamma * maxNextQ - oldQ);
-  m_qTable[state][action] = newQ;
-  NFD_LOG_DEBUG("Update Q-table: state=" << state.nodeId << "," << state.prefix 
-                << " action=" << action << " Q=" << newQ);
-}
-
-// 核心：Interest接收后转发决策
 void
 QLearningStrategy::afterReceiveInterest(const Interest& interest, const FaceEndpoint& ingress,
-                                       const shared_ptr<pit::Entry>& pitEntry)
+                                        const shared_ptr<pit::Entry>& pitEntry)
 {
-  NFD_LOG_TRACE("afterReceiveInterest");
+  NFD_LOG_DEBUG("afterReceiveInterest: " << interest.getName());
 
-  // 跳过已转发的Interest
-  if (hasPendingOutRecords(*pitEntry)) return;
-
-  const fib::Entry& fibEntry = this->lookupFib(*pitEntry);
-  const fib::NextHopList& nexthops = fibEntry.getNextHops();
-
-  // 检查是否有有效下一跳
-  if (!hasFaceForForwarding(ingress.face, nexthops, pitEntry)) {
-    this->rejectPendingInterest(pitEntry);
+  // 检查是否是重传
+  RetxSuppressionResult suppressResult = m_retxSuppression.decidePerPitEntry(*pitEntry);
+  if (suppressResult == RetxSuppressionResult::SUPPRESS) {
+    NFD_LOG_DEBUG("Interest " << interest.getName() << " suppressed");
     return;
   }
 
-  // 1. 获取当前状态
-  QState currentState = getCurrentState(ingress, interest);
-  // 2. ε-greedy选择动作（下一跳）
-  uint64_t chosenFaceId = chooseAction(currentState, nexthops);
-  // 3. 找到对应的Face并转发
-  for (const auto& nh : nexthops) {
-    if (nh.getFace().getId() == chosenFaceId && 
-        canForwardToNextHop(ingress.face, pitEntry, nh)) {
-      this->sendInterest(interest, nh.getFace(), pitEntry);
-      // 记录PIT条目对应的状态和动作，用于后续奖励计算
-      m_pitActionMap[pitEntry] = {currentState, chosenFaceId};
-      break;
+  // 提取当前状态
+  State currentState = extractState(interest, ingress, pitEntry);
+  if (currentState.availableNextHops.empty()) {
+    NFD_LOG_DEBUG("No available nexthops for " << interest.getName());
+    rejectPendingInterest(pitEntry);
+    return;
+  }
+
+  // 选择动作（下一跳）
+  Action selectedFace = selectAction(currentState);
+  Face* outFace = getFace(selectedFace);
+  if (outFace == nullptr) {
+    NFD_LOG_DEBUG("Selected face " << selectedFace << " not found");
+    rejectPendingInterest(pitEntry);
+    return;
+  }
+
+  // 转发Interest
+  NFD_LOG_DEBUG("Forward Interest " << interest.getName() << " to face " << selectedFace);
+  sendInterest(interest, *outFace, pitEntry);
+}
+
+void
+QLearningStrategy::afterReceiveData(const Data& data, const FaceEndpoint& ingress,
+                                    const shared_ptr<pit::Entry>& pitEntry)
+{
+  NFD_LOG_DEBUG("afterReceiveData: " << data.getName());
+
+  // 修复：传入Name而非Interest（调用重载的extractState）
+  State nextState = extractState(data.getName(), ingress, pitEntry);
+  
+  // 从PIT条目中获取原始Interest
+  const Interest& originalInterest = pitEntry->getInterest();
+  State currentState = extractState(originalInterest, ingress, pitEntry);
+
+  // 计算奖励（成功接收Data）
+  double reward = calculateReward(true, ingress.face.getId());
+  
+  // 更新Q值
+  Action takenAction = ingress.face.getId();
+  updateQValue(currentState, takenAction, reward, nextState);
+
+  // 执行默认的Data转发逻辑
+  Strategy::afterReceiveData(data, ingress, pitEntry);
+}
+
+void
+QLearningStrategy::afterReceiveNack(const lp::Nack& nack, const FaceEndpoint& ingress,
+                                    const shared_ptr<pit::Entry>& pitEntry)
+{
+  NFD_LOG_DEBUG("afterReceiveNack: " << nack.getInterest().getName() << " reason: " << nack.getReason());
+
+  // 修复：传入Name而非Interest（调用重载的extractState）
+  State nextState = extractState(nack.getInterest().getName(), ingress, pitEntry);
+  
+  // 获取原始Interest
+  const Interest& originalInterest = nack.getInterest();
+  State currentState = extractState(originalInterest, ingress, pitEntry);
+
+  // 计算奖励（Nack表示失败）
+  double reward = calculateReward(false, ingress.face.getId());
+  
+  // 更新Q值
+  Action takenAction = ingress.face.getId();
+  updateQValue(currentState, takenAction, reward, nextState);
+
+  // 执行默认的Nack处理逻辑
+  Strategy::afterReceiveNack(nack, ingress, pitEntry);
+}
+
+void
+QLearningStrategy::onDroppedInterest(const Interest& interest, Face& egress)
+{
+  NFD_LOG_DEBUG("onDroppedInterest: " << interest.getName());
+
+  // 修复：使用m_forwarder获取PIT（FaceTable没有getForwarder方法）
+  auto pitEntry = m_forwarder.getPit().find(interest);
+  if (!pitEntry) {
+    NFD_LOG_DEBUG("PIT entry not found for dropped interest");
+    return;
+  }
+
+  // 提取状态
+  FaceEndpoint ingress(egress, 0); // 简化：假设egress为入站face
+  State currentState = extractState(interest, ingress, pitEntry);
+  State nextState = extractState(interest.getName(), ingress, pitEntry);
+
+  // 计算奖励（Interest被丢弃）
+  double reward = calculateReward(false, egress.getId());
+  
+  // 更新Q值
+  Action takenAction = egress.getId();
+  updateQValue(currentState, takenAction, reward, nextState);
+}
+
+QLearningStrategy::State
+QLearningStrategy::extractState(const Interest& interest, const FaceEndpoint& ingress,
+                                const shared_ptr<pit::Entry>& pitEntry) const
+{
+  // 修复：调用Name版本的extractState（解决递归调用的类型错误）
+  return extractState(interest.getName(), ingress, pitEntry);
+}
+
+// 修复：添加Name版本的extractState定义（匹配声明）
+QLearningStrategy::State
+QLearningStrategy::extractState(const Name& prefix, const FaceEndpoint& ingress,
+                                const shared_ptr<pit::Entry>& pitEntry) const
+{
+  State state;
+  state.prefix = prefix.getPrefix(-1); // 去掉版本号等后缀，保留基础前缀
+  state.ingressFace = ingress.face.getId();
+  state.availableNextHops = getAvailableNextHops(*pitEntry);
+  
+  return state;
+}
+
+QLearningStrategy::Action
+QLearningStrategy::selectAction(const State& state)
+{
+  // ε-贪心策略：ε概率随机探索，1-ε概率利用最优动作
+  std::uniform_real_distribution<double> dist(0.0, 1.0);
+  if (dist(m_randomEngine) < m_epsilon) {
+    // 探索：随机选择一个可用下一跳
+    std::uniform_int_distribution<size_t> idxDist(0, state.availableNextHops.size() - 1);
+    size_t randomIdx = idxDist(m_randomEngine);
+    // 修复：无符号比较警告（randomIdx改为size_t）
+    if (randomIdx >= state.availableNextHops.size()) {
+      randomIdx = state.availableNextHops.size() - 1;
+    }
+    return state.availableNextHops[randomIdx];
+  }
+
+  // 利用：选择Q值最大的动作
+  double maxQ = -std::numeric_limits<double>::max();
+  Action bestAction = face::INVALID_FACEID;
+  
+  const auto& qActions = m_qTable[state];
+  for (const auto& [action, qValue] : qActions) {
+    if (qValue > maxQ) {
+      maxQ = qValue;
+      bestAction = action;
     }
   }
+
+  // 如果没有Q值记录，随机选一个
+  if (bestAction == face::INVALID_FACEID && !state.availableNextHops.empty()) {
+    bestAction = state.availableNextHops[0];
+  }
+
+  return bestAction;
 }
 
-// Data满足Interest时：正向奖励
 void
-QLearningStrategy::beforeSatisfyInterest(const shared_ptr<pit::Entry>& pitEntry,
-                                        const FaceEndpoint& ingress, const Data& data)
+QLearningStrategy::updateQValue(const State& currentState, Action action, double reward, const State& nextState)
 {
-  auto it = m_pitActionMap.find(pitEntry);
-  if (it == m_pitActionMap.end()) return;
+  // Q学习更新公式：Q(s,a) = Q(s,a) + α * [r + γ * max(Q(s',a')) - Q(s,a)]
+  double oldQ = m_qTable[currentState][action];
+  
+  // 计算nextState的最大Q值
+  double maxNextQ = 0.0;
+  if (!m_qTable[nextState].empty()) {
+    maxNextQ = std::max_element(m_qTable[nextState].begin(), m_qTable[nextState].end(),
+      [](const auto& a, const auto& b) { return a.second < b.second; })->second;
+  }
 
-  QState state = it->second.first;
-  uint64_t action = it->second.second;
-  QState nextState = getCurrentState(ingress, data.getName()); // 下一个状态（简化）
+  double newQ = oldQ + m_learningRate * (reward + m_discountFactor * maxNextQ - oldQ);
+  m_qTable[currentState][action] = newQ;
   
-  // 正向奖励：10 - 链路延迟（延迟越低，奖励越高）
-  double delay = getLinkDelay(ingress.face);
-  double reward = 10.0 - (delay / 10.0); // 归一化延迟到0~10
-  
-  // 更新Q表
-  updateQTable(state, action, reward, nextState);
-  // 移除PIT记录
-  m_pitActionMap.erase(it);
+  NFD_LOG_DEBUG("Update Q-value: state=" << currentState.prefix << " action=" << action 
+                << " oldQ=" << oldQ << " newQ=" << newQ);
 }
 
-// Interest超时：负向奖励
-void
-QLearningStrategy::beforeExpirePendingInterest(const shared_ptr<pit::Entry>& pitEntry)
+double
+QLearningStrategy::calculateReward(bool isSuccess, FaceId faceId) const
 {
-  auto it = m_pitActionMap.find(pitEntry);
-  if (it == m_pitActionMap.end()) return;
+  if (isSuccess) {
+    return REWARD_SUCCESS;
+  }
+  return REWARD_FAILURE;
+}
 
-  QState state = it->second.first;
-  uint64_t action = it->second.second;
-  QState nextState = state; // 超时无下一个状态，简化为当前状态
+std::vector<FaceId>
+QLearningStrategy::getAvailableNextHops(const pit::Entry& pitEntry) const
+{
+  std::vector<FaceId> nextHops;
   
-  // 负向奖励：-5
-  double reward = -5.0;
-  
-  // 更新Q表
-  updateQTable(state, action, reward, nextState);
-  // 移除PIT记录
-  m_pitActionMap.erase(it);
+  // 从FIB获取可用下一跳
+  const fib::Entry& fibEntry = lookupFib(pitEntry);
+  for (const fib::NextHop& nh : fibEntry.getNextHops()) {
+    Face* face = getFace(nh.getFace().getId());
+    // 修复：Face没有isDown()，改用Transport状态判断
+    if (face != nullptr && face->getTransport()->getState() == TransportState::UP) {
+      nextHops.push_back(face->getId());
+    }
+  }
+
+  return nextHops;
 }
 
 } // namespace fw
 } // namespace nfd
-
-// 注册策略（供ndnSIM调用）
-NFD_REGISTER_STRATEGY(nfd::fw::QLearningStrategy);
