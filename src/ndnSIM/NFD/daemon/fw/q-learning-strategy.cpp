@@ -53,7 +53,10 @@ void
 QLearningStrategy::afterReceiveData(const Data& data, const FaceEndpoint& ingress,
                                     const shared_ptr<pit::Entry>& pitEntry)
 {
-  NS_LOG_DEBUG("Received Data: " << data.getName());
+  // 强制输出（必看）
+  printf("=== Data逻辑执行 === Name: %s, Face ID: %lu\n", 
+         data.getName().toUri().c_str(), ingress.face.getId());
+  NS_LOG_INFO("Received Data: " << data.getName() << " from face " << ingress.face.getId());
 
   // 正向奖励：收到数据+10
   QLearningState state{data.getName(), ingress.face.getId()};

@@ -2,12 +2,24 @@
 #include "ns3/network-module.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/ndnSIM-module.h"
+#include "ns3/log.h"
+
+
 
 namespace ns3 {
 
 int
 main(int argc, char* argv[])
 {
+
+// 配置日志级别
+    // 核心：启用QLearningStrategy的INFO级别（覆盖之前的DEBUG）
+  LogComponentEnable ("QLearningStrategy", LOG_LEVEL_INFO);
+  // 同时启用ndn.Producer的日志，确认Data发送
+  LogComponentEnable ("ndn.Producer", LOG_LEVEL_INFO);
+
+  // 如果需要开启 ndn.L3Protocol 日志
+  LogComponentEnable ("ndn.L3Protocol", LOG_LEVEL_INFO);
   // 基础配置
   CommandLine cmd;
   cmd.Parse(argc, argv);
